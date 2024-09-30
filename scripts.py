@@ -19,6 +19,7 @@ from supabase import create_client, Client
 import yt_dlp
 import asyncio
 import aiohttp
+import mimetypes
 
 # Load environment variables and set up SSL
 load_dotenv()
@@ -332,6 +333,109 @@ async def process_batch(urls):
             except Exception as e:
                 logging.error(f"Error processing video {video_path}: {str(e)}")
 
+def upload_to_supabase(url, video_id, yt_video_id, video_path, video_info, clips):
+    try:
+        # Upload the source video to Supabase storage
+        video_storage_path = upload_to_supabase_storage(video_path, SOURCE_VIDEOS_BUCKET)
+        if not video_storage_path:
+            logging.error(f"Failed to upload source video {video_path} to Supabase")
+            return
+
+        # Verify the upload
+        if not verify_supabase_upload(video_storage_path, SOURCE_VIDEOS_BUCKET):
+            logging.error(f"Verification failed for uploaded video {video_path}")
+            return
+
+        ## MOVE LOGIC TO update_supabase
+        # # Update the videos table
+        # video_data = {
+        #     "id": video_id,
+        #     "filename": os.path.basename(video_storage_path),
+        #     "storage_path": video_storage_path,
+        #     "url": url,
+        #     "title": video_info.get('title', ''),
+        #     "description": video_info.get('description', ''),
+        #     "channel": video_info.get('uploader', ''),
+        #     "published_at": video_info.get('upload_date', ''),
+        # }
+        # supabase.table('videos').upsert(video_data).execute()
+
+        # Upload clips to Supabase storage and update clips table
+        for clip in clips:
+            clip_storage_path = upload_to_supabase_storage(clip['path'], CLIPS_BUCKET)
+            if clip_storage_path:
+                if not verify_supabase_upload(clip_storage_path, CLIPS_BUCKET):
+                    logging.error(f"Verification failed for uploaded clip {clip['path']}")
+                    continue
+                ## MOVE LOGIC TO update_supabase
+                # clip_data = {
+                #     "file_path": clip_storage_path,
+                #     "original_youtube_url": url,
+                #     "summary": clip['summary'],
+                #     "start_time": clip['start'],
+                #     "end_time": clip['end'],
+                #     "relevance_score": clip['relevance_score'],
+                #     "video_id": video_id,
+                # }
+                # supabase.table("clips").insert(clip_data).execute()
+            else:
+                logging.error(f"Failed to upload clip {clip['path']} to Supabase")
+
+        # Delete local files after successful upload and verification
+        os.remove(video_path)
+        logging.info(f"Deleted local source video: {video_path}")
+        for clip in clips:
+            os.remove(clip['path'])
+            logging.info(f"Deleted local clip: {clip['path']}")
+
+        logging.info(f"Completed processing and uploading for Video ID {video_id}")
+    except Exception as e:
+        logging.error(f"Error uploading to Supabase: {e}")
+
+def upload_to_supabase_storage(file_path, bucket):
+    try:
+        with open(file_path, 'rb') as f:
+            file_data = f.read()
+        file_name = os.path.basename(file_path)
+        storage_path = f"{bucket}/{file_name}"
+        
+        # Set the correct content type
+        content_type, _ = mimetypes.guess_type(file_path)
+        if content_type is None:
+            content_type = 'application/octet-stream'
+        
+        response = supabase.storage.from_(bucket).upload(
+            storage_path, 
+            file_data, 
+            file_options={"content-type": content_type}
+        )
+        if 'error' in response:
+            logging.error(f"Error uploading {file_path} to Supabase storage: {response['error']}")
+            return None
+        else:
+            logging.info(f"Uploaded {file_path} to Supabase storage at {storage_path}")
+            return storage_path
+    except Exception as e:
+        logging.error(f"Error uploading {file_path} to Supabase storage: {e}")
+        return None
+    
+def verify_supabase_upload(file_path, bucket):
+    try:
+        file_name = os.path.basename(file_path)
+        storage_path = f"{bucket}/{file_name}"
+        
+        # Check if the file exists in Supabase storage
+        res = supabase.storage.from_(bucket).list(storage_path)
+        if res and len(res) > 0:
+            logging.info(f"Verified upload of {file_path} to Supabase storage at {storage_path}")
+            return True
+        else:
+            logging.error(f"Failed to verify upload of {file_path} to Supabase storage")
+            return False
+    except Exception as e:
+        logging.error(f"Error verifying upload of {file_path} to Supabase storage: {e}")
+        return False
+
 async def update_supabase(url, video_id, video_path, clips):
     # Update videos table
     supabase.table('videos').update({"filename": os.path.basename(video_path)}).eq('url', url).execute()
@@ -346,8 +450,8 @@ async def update_supabase(url, video_id, video_path, clips):
         }
         supabase.table("clips").insert(clip_data).execute()
 
-async def ensure_test_urls_in_supabase():
-    for url in TEST_URLS:
+async def ensure_test_urls_in_supabase(urls):
+    for url in urls:
         result = supabase.table('videos').select('url').eq('url', url).execute()
         if not result.data:
             # If the URL doesn't exist, insert it with minimal required fields
